@@ -1,8 +1,9 @@
 import cv2
 from ultralytics import YOLO
 import numpy as np
-import time # <-- Add this import
-
+import time
+import csv
+from datetime import datetime
 # --- CONFIGURATION ---
 VIDEO_SOURCE = 0 
 MODEL_WEIGHTS = 'yolov8n.pt' 
@@ -10,6 +11,8 @@ LEARNING_FRAMES = 150
 NOTIFICATION_COOLDOWN = 5.0 # <-- NEW: Cooldown period in seconds (e.g., 5 seconds)
 PROMOTION_TIME_SEC = 10.0
 MISSING_FRAME_THRESHOLD = 90
+VETTING_THRESHOLD_FRAMES = 5  # Object must be seen for 5 frames to be "real"
+VETTING_TRACKS = {}
 # ---------------------
 
 # --- GLOBAL REFERENCE DICTIONARY ---
@@ -81,19 +84,16 @@ def learn_static_background(model, cap):
             }
 
 
-def log_anomaly_with_cooldown(message):
-    """Prints the anomaly message only if the cooldown has elapsed."""
-    global LAST_NOTIFICATION_TIME
+def log_event(message):
+    """Logs an event instantly to the console and the CSV file."""
+    # 1. Print to console for immediate feedback
+    print(message)
     
-    current_time = time.time()
-    
-    if (current_time - LAST_NOTIFICATION_TIME) > NOTIFICATION_COOLDOWN:
-        print(message) 
-        LAST_NOTIFICATION_TIME = current_time # Reset the timer
-        return True # Notification was sent
-    
-    return False # Notification was blocked by cooldown
-
+    # 2. Append to the CSV file for your separate application
+    with open('anomaly_log.csv', mode='a', newline='') as file:
+        writer = csv.writer(file)
+        timestamp = datetime.now().strftime("%H:%M:%S") # Fine-grained time
+        writer.writerow([timestamp, message])
 
 def run_anomaly_pipeline():
     """
@@ -130,6 +130,8 @@ def run_anomaly_pipeline():
     while cap.isOpened():
         success, frame = cap.read()
         
+        clean_frame = frame.copy()
+
         if success:
             
             current_time = time.time()
@@ -152,28 +154,37 @@ def run_anomaly_pipeline():
                 
                 if track_id not in detected_ids:
                     # Object is MISSING in this frame
-                    
-                    # 2a. Increment the missing frame counter
                     data['missing_frames'] += 1
-                    data['current_state'] = 'MISSING'
                     
-                    # 2b. Check if the object has exceeded the threshold
-                    if data['missing_frames'] >= MISSING_FRAME_THRESHOLD:
-                        # ANOMALY TRIGGERED!
-                        message = f"🛑 DISAPPEARANCE ANOMALY: {data['class_name']} (ID {track_id}) is missing!"
-                        log_anomaly_with_cooldown(message)
-                        anomaly_messages.append(message)
+                    # Only check for anomaly if we haven't reported it yet
+                    if data['current_state'] != 'REPORTED_MISSING':
+                        
+                        # Check if the missing duration exceeds the threshold
+                        if data['missing_frames'] >= MISSING_FRAME_THRESHOLD:
+                            # --- ANOMALY TRIGGERED (FIRST TIME) ---
+                            message = f"DISAPPEARANCE ANOMALY: {data['class_name']} (ID {track_id}) is missing!"
+                            
+                            log_event(message)
+
+                            # CRITICAL: Update state so we don't report this again
+                            data['current_state'] = 'REPORTED_MISSING'
+                        
+                        else:
+                            # Not yet threshold, just mark as generally missing
+                            data['current_state'] = 'MISSING'
+                    
+                    else:
+                        pass
                         
                 else:
                     # Object IS PRESENT in this frame
-                    if data['current_state'] == 'MISSING' and data['missing_frames'] > 0:
-                        # Object has returned after being missing (Reappearance Notification)
-                        
-                        notification = f"✅ REAPPEARANCE: {data['class_name']} (ID {track_id}) has returned."
-                        print(notification) # Print immediately as confirmation
-                        anomaly_messages.append(notification)
+                    
+                    # If it was previously reported missing, announce its return
+                    if data['current_state'] == 'REPORTED_MISSING':
+                        notification = f"REAPPEARANCE: {data['class_name']} (ID {track_id}) has returned."
+                        print(notification)
 
-                    # Reset the missing counter and state
+                    # Reset counters and state completely
                     data['missing_frames'] = 0
                     data['current_state'] = 'PRESENT'
 
@@ -184,31 +195,58 @@ def run_anomaly_pipeline():
             if boxes.id is not None:
                 for box_index in range(len(boxes.id)):
                     track_id = int(boxes.id[box_index])
+                    detected_ids.add(track_id)
                     
-                    # Only process if not a KNOWN STATIC OBJECT (Disappearance handled above)
-                    if track_id not in STATIC_BACKGROUND_REF:
-                        
-                        class_id = int(boxes.cls[box_index])
-                        class_name = model.names[class_id]
-                        box_xyxy = boxes.xyxy[box_index]
-                        x_center = int((box_xyxy[0] + box_xyxy[2]) / 2)
-                        y_center = int((box_xyxy[1] + box_xyxy[3]) / 2)
-                        current_position = (x_center, y_center)
-                        
-                        # B. NEW OBJECT (Initialize timer)
-                        if track_id not in DYNAMIC_TRACKS_FOR_LEARNING:
-                            message = f"🚨 NEW OBJECT: {class_name} (ID {track_id}) - Starting Promotion Timer"
-                            log_anomaly_with_cooldown(message)
-                            
-                            DYNAMIC_TRACKS_FOR_LEARNING[track_id] = {
-                                'class_name': class_name,
-                                'start_time': current_time,
-                                'initial_position': current_position,
-                            }
-                            anomaly_messages.append(f"NEW: {class_name} (ID {track_id}) - Timer ON")
+                    class_id = int(boxes.cls[box_index])
+                    class_name = model.names[class_id]
+                    box_xyxy = boxes.xyxy[box_index]
+                    x_center = int((box_xyxy[0] + box_xyxy[2]) / 2)
+                    y_center = int((box_xyxy[1] + box_xyxy[3]) / 2)
+                    current_position = (x_center, y_center)
 
+                    # A. KNOWN STATIC OBJECT
+                    if track_id in STATIC_BACKGROUND_REF:
+                        STATIC_BACKGROUND_REF[track_id]['current_state'] = 'PRESENT'
+
+                    # B. NEW OBJECT CHECK (With Reappearance and Promotion Prevention)
+                    elif track_id not in DYNAMIC_TRACKS_FOR_LEARNING:
+                        found_match = False
+                        matched_static_id = None
+
+                        # Look for a missing object of the same class
+                        for static_id, data in STATIC_BACKGROUND_REF.items():
+                            if data['current_state'] == 'REPORTED_MISSING' and data['class_name'] == class_name:
+                                matched_static_id = static_id
+                                found_match = True
+                                break
+                        
+                        if found_match:
+                            # --- FIX: TRANSFER THE DATA TO THE NEW ID ---
+                            log_event(f"REAPPEARANCE: {class_name} is back!")
+                            
+                            # Move the data to the new current Track ID
+                            STATIC_BACKGROUND_REF[track_id] = STATIC_BACKGROUND_REF.pop(matched_static_id)
+                            
+                            # Update the state and position
+                            STATIC_BACKGROUND_REF[track_id]['current_state'] = 'PRESENT'
+                            STATIC_BACKGROUND_REF[track_id]['missing_frames'] = 0
+                            STATIC_BACKGROUND_REF[track_id]['ref_position_xy'] = current_position
+                        
+                        if not found_match:
+                            VETTING_TRACKS[track_id] = VETTING_TRACKS.get(track_id, 0) + 1
+
+                            if VETTING_TRACKS[track_id] >= VETTING_THRESHOLD_FRAMES:
+                                log_event(f"NEW OBJECT VERIFIED: {class_name} (ID {track_id})")
+                                
+                                DYNAMIC_TRACKS_FOR_LEARNING[track_id] = {
+                                    'class_name': class_name,
+                                    'start_time': current_time,
+                                    'initial_position': current_position,
+                                }
+
+                                del VETTING_TRACKS[track_id]
                         # C. LEARNING OBJECT: Check for Promotion
-                        elif track_id in DYNAMIC_TRACKS_FOR_LEARNING:
+                    elif track_id in DYNAMIC_TRACKS_FOR_LEARNING:
                             candidate = DYNAMIC_TRACKS_FOR_LEARNING[track_id]
                             time_elapsed = current_time - candidate['start_time']
                             
@@ -221,10 +259,9 @@ def run_anomaly_pipeline():
                                     'missing_frames': 0
                                 }
                                 del DYNAMIC_TRACKS_FOR_LEARNING[track_id]
-                                
-                                promotion_msg = f"✅ PROMOTION: {candidate['class_name']} (ID {track_id}) added to Normal State."
-                                print(promotion_msg)
-                                anomaly_messages.append(promotion_msg)
+                                msg = f"PROMOTION: {candidate['class_name']} (ID {track_id}) is now Static"
+                                log_event(msg)
+                                anomaly_messages.append(msg)
                                 
                             else:
                                 # Still in learning state
@@ -241,17 +278,19 @@ def run_anomaly_pipeline():
                     tracks_to_delete.append(track_id)
             
             for track_id in tracks_to_delete:
-                 print(f"TRACK LOST: ID {track_id} disappeared before promotion. Deleting.")
+                 # Logic: We silently delete the track. No print() needed.
                  del DYNAMIC_TRACKS_FOR_LEARNING[track_id]
-                
             # Display the anomaly messages on the video frame
             for i, msg in enumerate(anomaly_messages):
                 color = (0, 0, 255) 
                 cv2.putText(frame_with_detections, msg, (10, 50 + i * 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2) 
             
-            cv2.imshow("Anomaly Detector", frame_with_detections)
+            update_status_dashboard(STATIC_BACKGROUND_REF) 
+            #DashBoard
 
+            cv2.imshow("Anomaly Detector", frame_with_detections)
+            cv2.imshow("Live Raw Feed", clean_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
         else:
@@ -261,6 +300,33 @@ def run_anomaly_pipeline():
     cap.release()
     cv2.destroyAllWindows()
     print("Application closed.")
+
+def update_status_dashboard(static_ref):
+    # 1. Create a black background (Height depends on number of objects)
+    height = max(200, len(static_ref) * 40 + 60)
+    dashboard = np.zeros((height, 400, 3), dtype=np.uint8)
+    
+    # 2. Add Header
+    cv2.putText(dashboard, "SYSTEM STATUS: STATIC OBJECTS", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.line(dashboard, (10, 40), (380, 40), (255, 255, 255), 1)
+    
+    # 3. List the Objects
+    y_pos = 70
+    for track_id, data in static_ref.items():
+        name = data['class_name']
+        state = data['current_state']
+        
+        # Color code: Green for Present, Red for Missing
+        color = (0, 255, 0) if state == 'PRESENT' else (0, 0, 255)
+        
+        status_text = f"ID {track_id}: {name} -> {state}"
+        cv2.putText(dashboard, status_text, (20, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        y_pos += 40
+        
+    # 4. Display the window
+    cv2.imshow("Object Status Dashboard", dashboard)
 
 if __name__ == "__main__":
     run_anomaly_pipeline()
