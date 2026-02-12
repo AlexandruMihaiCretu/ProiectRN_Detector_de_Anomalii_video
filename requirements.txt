@@ -1,0 +1,12 @@
+# Computer Vision and Object Detection
+ultralytics
+opencv-python
+
+# Machine Learning and Data Handling
+numpy
+joblib
+pandas
+scikit-learn
+
+# Graphical User Interface (GUI)
+PyQt6
